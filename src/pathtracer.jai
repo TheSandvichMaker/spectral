@@ -130,12 +130,12 @@ Tile :: struct
     y1: int;
 };
 
-render_scene :: (camera: Camera, scene: *Scene, bitmap: Bitmap, tile: Tile, frame_index: int)
+render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: Tile, frame_index: int)
 {
     camera_x, camera_y, camera_z := basis_vectors(camera.d);
 
-    w := cast(float) bitmap.w;
-    h := cast(float) bitmap.h;
+    w := cast(float) acc.w;
+    h := cast(float) acc.h;
 
     film_w := w / h;
     film_h := 1.0;
@@ -153,11 +153,11 @@ render_scene :: (camera: Camera, scene: *Scene, bitmap: Bitmap, tile: Tile, fram
 
     for y: tile.y0..tile.y1-1
     {
-        v := 1.0 - 2.0*(cast(float) y / cast(float) bitmap.h);
+        v := 1.0 - 2.0*(cast(float) y / h);
 
         for x: tile.x0..tile.x1-1
         {
-            u := -1.0 + 2.0*(cast(float) x / cast(float) bitmap.w);
+            u := -1.0 + 2.0*(cast(float) x / w);
 
             p := camera.p;
 
@@ -172,10 +172,8 @@ render_scene :: (camera: Camera, scene: *Scene, bitmap: Bitmap, tile: Tile, fram
             color.z += 1.0 / 255.0;
             color = saturate(color);
 
-            bitmap.data[x*4 + y*bitmap.stride + 2] = cast(u8) (255.0*color.x);
-            bitmap.data[x*4 + y*bitmap.stride + 1] = cast(u8) (255.0*color.y);
-            bitmap.data[x*4 + y*bitmap.stride + 0] = cast(u8) (255.0*color.z);
-            bitmap.data[x*4 + y*bitmap.stride + 3] = 255;
+            data := cast(*Vector4) (cast(*u8) acc.data.data + x*size_of(Vector4) + y*acc.stride);
+            << data = make_vector4(color.x, color.y, color.z, 1.0);
         }
     }
 }
@@ -209,7 +207,7 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series) -> 
             ray = make_ray(hit_p + EPSILON*n, r);
 
             throughput *= dot(ray.d, n);
-            throughput *= TAU;
+            throughput *= 2*PI;
         }
         else
         {

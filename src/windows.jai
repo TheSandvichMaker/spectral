@@ -6,6 +6,7 @@ CONDITION_VARIABLE :: struct
     value: *void;
 }
 CONDITION_VARIABLE_INIT :: CONDITION_VARIABLE.{null};
+CONDITION_VARIABLE_LOCKMODE_SHARED : u32 : 0x1; 
 
 InitializeConditionVariable :: (ConditionVariable: *CONDITION_VARIABLE) #foreign kernel32;
 SleepConditionVariableCS    :: (ConditionVariable: *CONDITION_VARIABLE, CriticalSection: *CRITICAL_SECTION, dwMilliseconds: u32) -> BOOL #foreign kernel32;

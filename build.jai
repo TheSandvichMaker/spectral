@@ -35,7 +35,7 @@
 
         set_build_options(options, w);
 
-        add_build_string("DEBUG :: false;", w);
+        add_build_string("DEBUG :: true;", w);
         add_build_file("src/main.jai", w);
     }
 
