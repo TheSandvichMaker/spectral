@@ -27,8 +27,39 @@ Accumulation_Buffer :: struct
     w: int;
     h: int;
     stride: int;
-    data: [] Vector4;
-    frame_count: int;
+    data: *Vector3;
+    frame_count: int = 1;
+}
+
+get_texel :: inline (acc: Accumulation_Buffer, x: int, y: int) -> *Vector3
+{
+    return cast(*Vector3) (cast(*u8) acc.data + x*size_of(Vector3) + y*acc.stride);
+}
+
+make_accumulation_buffer :: (w: int, h: int) -> Accumulation_Buffer
+{
+    acc: Accumulation_Buffer;
+    acc.w      = w;
+    acc.h      = h;
+    acc.stride = size_of(Vector3)*acc.w;
+    acc.data   = alloc(size_of(Vector3)*acc.w*acc.h);
+    memset(acc.data, 0, size_of(Vector3)*acc.w*acc.h);
+    return acc;
+}
+
+resize :: (acc: *Accumulation_Buffer, w: int, h: int)
+{
+    if w != acc.w || h != acc.h
+    {
+        free(acc.data);
+        << acc = make_accumulation_buffer(w, h);
+    }
+}
+
+reset :: (acc: *Accumulation_Buffer)
+{
+    acc.frame_count = 1;
+    memset(acc.data, 0, size_of(Vector3)*acc.w*acc.h);
 }
 
 Shared_Render_Data :: struct
@@ -218,7 +249,7 @@ main :: ()
         thread.data = data;
         if !thread_init(thread, render_thread)
         {
-            print("Could not create render thread.\n", to_standard_error=true);
+            error_box("Could not create render thread.");
             return;
         }
 
@@ -230,8 +261,7 @@ main :: ()
 
     render_start_time := get_time();
 
-    accumulation_buffer: Accumulation_Buffer;
-    map_accumulation_buffer(*accumulation_buffer, xx render_w, xx render_h);
+    accumulation_buffer := make_accumulation_buffer(render_w, render_h);
 
     cursor_locked := false;
 
@@ -239,28 +269,10 @@ main :: ()
     {
         prepare_for_next_frame(*input);
 
-        rect: RECT;
-        GetClientRect(hwnd, *rect);
+        client_rect: RECT;
+        GetClientRect(hwnd, *client_rect);
 
-        screen_rect := rect;
-
-        // oh my god...
-        screen_rect_lr: POINT;
-        screen_rect_lr.x = screen_rect.left;
-        screen_rect_lr.y = screen_rect.right;
-
-        ClientToScreen(hwnd, *screen_rect_lr);
-
-        screen_rect_tb: POINT;
-        screen_rect_tb.x = screen_rect.top;
-        screen_rect_tb.y = screen_rect.bottom;
-
-        ClientToScreen(hwnd, *screen_rect_tb);
-
-        screen_rect.left   = screen_rect_lr.x;
-        screen_rect.right  = screen_rect_lr.y;
-        screen_rect.top    = screen_rect_tb.x;
-        screen_rect.bottom = screen_rect_tb.y;
+        screen_rect := client_to_screen(hwnd, client_rect);
 
         msg: MSG;
         if PeekMessageW(*msg, null, 0, 0, PM_REMOVE)
@@ -311,8 +323,8 @@ main :: ()
             }
         }
 
-        render_w = xx (rect.right - rect.left);
-        render_h = xx (rect.bottom - rect.top);
+        render_w = xx (client_rect.right - client_rect.left);
+        render_h = xx (client_rect.bottom - client_rect.top);
 
         cursor_delta_x: int;
         cursor_delta_y: int;
@@ -320,8 +332,8 @@ main :: ()
         if cursor_locked
         {
             mid_point: POINT;
-            mid_point.x = (rect.left + rect.right) / 2;
-            mid_point.y = (rect.bottom + rect.top) / 2;
+            mid_point.x = (client_rect.left + client_rect.right) / 2;
+            mid_point.y = (client_rect.bottom + client_rect.top) / 2;
 
             ClientToScreen(hwnd, *mid_point);
 
@@ -345,10 +357,21 @@ main :: ()
             render_time := render_end_time - render_start_time;
             render_start_time = render_end_time;
 
-            unmap_accumulation_buffer();
-            resolve_accumulation_buffer();
+            resized := maybe_resize_textures(render_w, render_h);
+            if resized
+            {
+                resize(*accumulation_buffer, render_w, render_h);
+                accumulation_buffer.frame_count = 0; // because of the += 1 down below. gross
+            }
 
-            map_accumulation_buffer(*accumulation_buffer, xx render_w, xx render_h);
+            resolve_accumulation_buffer(*accumulation_buffer);
+            accumulation_buffer.frame_count += 1;
+
+            if updated_camera
+            {
+                updated_camera = false;
+                reset(*accumulation_buffer);
+            }
 
             tile_count_x := (accumulation_buffer.w + TILE_SIZE - 1) / TILE_SIZE;
             tile_count_y := (accumulation_buffer.h + TILE_SIZE - 1) / TILE_SIZE;
@@ -362,7 +385,7 @@ main :: ()
             shared_data.frame_index += 1;
 
             shared_data.tiles_unfinished = tile_count_total;
-            shared_data.tiles_to_consume = tile_count_total; // writing this last because it's the state we check to mitigate spurious wake-ups
+            atomic_write(*shared_data.tiles_to_consume, tile_count_total); // writing this last because it's the state we check to mitigate spurious wake-ups
 
             ReleaseSRWLockExclusive(*shared_data.render_lock);
             WakeAllConditionVariable(*shared_data.render_cond);
@@ -411,6 +434,8 @@ init_scene :: (camera: *Camera, scene: *Scene)
     add_primitive(scene, plane);
 }
 
+updated_camera := false;
+
 update_camera :: (camera_: Camera, input: Input, dt: float) -> Camera
 {
     camera := camera_;
@@ -440,6 +465,12 @@ update_camera :: (camera_: Camera, input: Input, dt: float) -> Camera
     camera.d += dt*turn_speed*turn_delta;
     camera.d = normalize(camera.d);
 
+    if length(move_delta) > 0.0 ||
+       length(turn_delta) > 0.0
+    {
+        updated_camera = true;
+    }
+
     return camera;
 }
 
@@ -463,7 +494,7 @@ window_proc :: (hWnd: HWND, message: u32, wParam: WPARAM, lParam: LPARAM) -> LRE
     return 0; 
 } 
 
-init_window :: (w: int, h: int) -> bool, error_message := ""
+init_window :: (w: int, h: int) -> success: bool, error_message: string
 {
     window_class: WNDCLASSEXW;
     window_class.cbSize        = size_of(WNDCLASSEXW);
@@ -502,12 +533,37 @@ init_window :: (w: int, h: int) -> bool, error_message := ""
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
 
-    return true;
+    return true, "";
 }
 
 error_box :: (message: string)
 {
     MessageBoxW(null, utf8_to_wide(message), utf8_to_wide("Error"), MB_OK);
+}
+
+client_to_screen :: (hwnd: HWND, rect: RECT) -> RECT
+{
+    // good API, windows...
+
+    screen_rect_lr: POINT;
+    screen_rect_lr.x = rect.left;
+    screen_rect_lr.y = rect.right;
+
+    ClientToScreen(hwnd, *screen_rect_lr);
+
+    screen_rect_tb: POINT;
+    screen_rect_tb.x = rect.top;
+    screen_rect_tb.y = rect.bottom;
+
+    ClientToScreen(hwnd, *screen_rect_tb);
+
+    result: RECT;
+    result.left   = screen_rect_lr.x;
+    result.right  = screen_rect_lr.y;
+    result.top    = screen_rect_tb.x;
+    result.bottom = screen_rect_tb.y;
+
+    return result;
 }
 
 // d3d11
@@ -521,9 +577,14 @@ D3D_State :: struct
     device_context                 : *ID3D11DeviceContext;
     swap_chain                     : *IDXGISwapChain1;
 
+    nearest_neighbour_sampler      : *ID3D11SamplerState;
+
+    fullscreen_vs                  : *ID3D11VertexShader;
+    resolve_accumulation_buffer_cb : *ID3D11Buffer;
+    resolve_accumulation_buffer_ps : *ID3D11PixelShader;
+
     accumulation_buffer            : *ID3D11Texture2D;
     accumulation_buffer_srv        : *ID3D11ShaderResourceView;
-    nearest_neighbour_sampler      : *ID3D11SamplerState;
 
     target_texture                 : *ID3D11Texture2D;
     target_texture_srv             : *ID3D11ShaderResourceView;
@@ -531,12 +592,6 @@ D3D_State :: struct
 
     back_buffer                    : *ID3D11Texture2D;
     back_buffer_rtv                : *ID3D11RenderTargetView;
-
-    fullscreen_vs                  : *ID3D11VertexShader;
-    resolve_accumulation_buffer_cb : *ID3D11Buffer;
-    resolve_accumulation_buffer_ps : *ID3D11PixelShader;
-
-    fullscreen_vertex_layout       : *ID3D11InputLayout;
 
     viewport                       : D3D11_VIEWPORT;
 
@@ -577,12 +632,11 @@ compile_shader :: (source: string, entry_point: string, shader_model: string) ->
     return bytecode, hr;
 }
 
-init_d3d :: () -> bool, error_message := ""
+init_d3d :: () -> success: bool, error_message: string
 {
     hr: HRESULT;
 
     flags: D3D11_CREATE_DEVICE_FLAG;
-    flags |= .BGRA_SUPPORT;
     flags |= .DEBUG;
 
     driver_types   := D3D_DRIVER_TYPE.[.HARDWARE, .WARP, .REFERENCE];
@@ -633,7 +687,7 @@ init_d3d :: () -> bool, error_message := ""
         sd: DXGI_SWAP_CHAIN_DESC1;
         sd.Width              = w;
         sd.Height             = h;
-        sd.Format             = .B8G8R8A8_UNORM;
+        sd.Format             = .R8G8B8A8_UNORM;
         sd.SampleDesc.Count   = 1;
         sd.SampleDesc.Quality = 0;
         sd.BufferUsage        = .RENDER_TARGET_OUTPUT;
@@ -694,7 +748,6 @@ init_d3d :: () -> bool, error_message := ""
         if FAILED(hr)  return false, "Failed to create pixel shader";
     }
 
-    // create constant buffer
     {
         desc: D3D11_BUFFER_DESC;
         desc.ByteWidth      = size_of(Resolve_Accumulation_Buffer_PS_Parameters);
@@ -710,7 +763,7 @@ init_d3d :: () -> bool, error_message := ""
         if FAILED(hr)  return false, "Failed to create constant buffer";
     }
 
-    return true;
+    return true, "";
 }
 
 release_textures :: ()
@@ -730,13 +783,20 @@ create_textures :: (w: u32, h: u32) -> bool, string
 
     hr: HRESULT;
 
+    d3d.viewport.Width  = xx w;
+    d3d.viewport.Height = xx h;
+    d3d.viewport.MinDepth = 0.0;
+    d3d.viewport.MaxDepth = 1.0;
+    d3d.viewport.TopLeftX = 0.0;
+    d3d.viewport.TopLeftY = 0.0;
+
     {
         tex_desc: D3D11_TEXTURE2D_DESC;
         tex_desc.Width              = w;
         tex_desc.Height             = h;
         tex_desc.MipLevels          = 1;
         tex_desc.ArraySize          = 1;
-        tex_desc.Format             = .R32G32B32A32_FLOAT;
+        tex_desc.Format             = .R32G32B32_FLOAT;
         tex_desc.SampleDesc.Count   = 1;
         tex_desc.SampleDesc.Quality = 0;
         tex_desc.Usage              = .DYNAMIC;
@@ -756,7 +816,7 @@ create_textures :: (w: u32, h: u32) -> bool, string
         tex_desc.Height             = h;
         tex_desc.MipLevels          = 1;
         tex_desc.ArraySize          = 1;
-        tex_desc.Format             = .B8G8R8A8_UNORM_SRGB;
+        tex_desc.Format             = .R8G8B8A8_UNORM_SRGB;
         tex_desc.SampleDesc.Count   = 1;
         tex_desc.SampleDesc.Quality = 0;
         tex_desc.Usage              = .DEFAULT;
@@ -782,8 +842,11 @@ create_textures :: (w: u32, h: u32) -> bool, string
     return true, "";
 }
 
-map_accumulation_buffer :: (result: *Accumulation_Buffer, w: u32, h: u32) -> Accumulation_Buffer
+maybe_resize_textures :: (w_: int, h_: int) -> bool
 {
+    w: u32 = xx w_;
+    h: u32 = xx h_;
+
     hr: HRESULT;
 
     if w != d3d.display_w ||
@@ -796,7 +859,7 @@ map_accumulation_buffer :: (result: *Accumulation_Buffer, w: u32, h: u32) -> Acc
 
         if w && h
         {
-            hr = IDXGISwapChain_ResizeBuffers(d3d.swap_chain, 2, w, h, .B8G8R8A8_UNORM, 0);
+            hr = IDXGISwapChain_ResizeBuffers(d3d.swap_chain, 2, w, h, .R8G8B8A8_UNORM, 0);
             if always(SUCCEEDED(hr))
             {
                 success, message := create_textures(w, h);
@@ -806,37 +869,54 @@ map_accumulation_buffer :: (result: *Accumulation_Buffer, w: u32, h: u32) -> Acc
                 }
             }
         }
+
+        return true;
     }
 
-    if d3d.accumulation_buffer
+    return false;
+}
+
+resolve_accumulation_buffer :: (acc: *Accumulation_Buffer)
+{
     {
         mapped: D3D11_MAPPED_SUBRESOURCE;
+        hr := ID3D11DeviceContext_Map(d3d.device_context, d3d.resolve_accumulation_buffer_cb, 0, .WRITE_DISCARD, 0, *mapped);
 
-        hr = ID3D11DeviceContext_Map(d3d.device_context, d3d.accumulation_buffer, 0, .WRITE_DISCARD, 0, *mapped);
         if always(SUCCEEDED(hr))
         {
-            result.w          = xx w;
-            result.h          = xx h;
-            result.stride     = xx mapped.RowPitch;
-            result.data.data  = xx mapped.pData;
-            result.data.count = xx mapped.DepthPitch;
+            parameters := cast(*Resolve_Accumulation_Buffer_PS_Parameters) mapped.pData;
+            parameters.frame_count = cast(float) acc.frame_count;
 
-            assert(result.w*size_of(Vector4) <= result.stride);
-            assert(result.w*result.h*size_of(Vector4) <= result.data.count);
+            ID3D11DeviceContext_Unmap(d3d.device_context, d3d.resolve_accumulation_buffer_cb, 0);
         }
     }
 
-    return result;
-}
+    {
+        mapped: D3D11_MAPPED_SUBRESOURCE;
 
-unmap_accumulation_buffer :: ()
-{
-    ID3D11DeviceContext_Unmap(d3d.device_context, d3d.accumulation_buffer, 0);
-}
+        hr := ID3D11DeviceContext_Map(d3d.device_context, d3d.accumulation_buffer, 0, .WRITE_DISCARD, 0, *mapped);
+        if always(SUCCEEDED(hr))
+        {
+            dst := mapped.pData;
 
-resolve_accumulation_buffer :: ()
-{
-    ID3D11DeviceContext_OMSetRenderTargets(d3d.device_context, 1, *d3d.target_texture_rtv, null);
+            if mapped.RowPitch == acc.stride
+            {
+                memcpy(dst, acc.data, size_of(Vector3)*acc.w*acc.h);
+            }
+            else
+            {
+                for y: 0..acc.h-1
+                {
+                    memcpy(dst, acc.data + y*acc.stride, acc.stride);
+                    dst += mapped.RowPitch;
+                }
+            }
+
+            ID3D11DeviceContext_Unmap(d3d.device_context, d3d.accumulation_buffer, 0);
+        }
+    }
+
+    ID3D11DeviceContext_OMSetRenderTargets(d3d.device_context, 1, *d3d.back_buffer_rtv, null);
     ID3D11DeviceContext_RSSetViewports(d3d.device_context, 1, *d3d.viewport);
     ID3D11DeviceContext_IASetPrimitiveTopology(d3d.device_context, D3D11_PRIMITIVE_TOPOLOGY.TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(d3d.device_context, d3d.fullscreen_vs, null, 0);
@@ -849,7 +929,7 @@ resolve_accumulation_buffer :: ()
 
 present :: ()
 {
-    ID3D11DeviceContext_CopyResource(d3d.device_context, d3d.target_texture, d3d.back_buffer);
+    // ID3D11DeviceContext_CopyResource(d3d.device_context, d3d.back_buffer, d3d.target_texture);
 
     hr := IDXGISwapChain_Present(d3d.swap_chain, 1, 0);
     if hr == DXGI_STATUS_OCCLUDED

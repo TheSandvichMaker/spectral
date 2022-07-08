@@ -146,6 +146,9 @@ render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: 
     inv_half_film_w := 1.0 / half_film_w;
     inv_half_film_h := 1.0 / half_film_h;
 
+    pixel_w := 1.0 / w;
+    pixel_h := 1.0 / h;
+
     film_distance := film_h / tan(to_radians(camera.fov));
 
     random: Random_Series;
@@ -162,18 +165,25 @@ render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: 
             p := camera.p;
 
             film_o := -camera_z * film_distance;
-            film_p := film_o + u*half_film_w*camera_x + v*half_film_h*camera_y;
+
+            jitter_x := 0.5*random_bilateral(*random);
+            jitter_y := 0.5*random_bilateral(*random);
+
+            film_p := film_o;
+            film_p += (u + pixel_w*jitter_x)*half_film_w*camera_x;
+            film_p += (v + pixel_h*jitter_y)*half_film_h*camera_y;
+
             d := normalize(film_p);
 
             r := make_ray(p, d);
+
             color := integrate_scene(scene, r, *random);
             color.x += 1.0 / 255.0;
             color.y += 1.0 / 255.0;
             color.z += 1.0 / 255.0;
             color = saturate(color);
 
-            data := cast(*Vector4) (cast(*u8) acc.data.data + x*size_of(Vector4) + y*acc.stride);
-            << data = make_vector4(color.x, color.y, color.z, 1.0);
+            << get_texel(acc, x, y) += make_vector3(color.x, color.y, color.z);
         }
     }
 }
