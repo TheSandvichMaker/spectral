@@ -1,3 +1,8 @@
+frac :: inline (x: float) -> float #must
+{
+    return x - floor(x);
+}
+
 to_radians :: inline (deg: float) -> float #must
 {
     return deg*(PI / 180.0);

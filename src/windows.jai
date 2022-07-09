@@ -35,3 +35,5 @@ TIMERPROC :: #type (hwnd: HWND, uMsg: u32, idEvent: u64, dwTime: u32) #c_call;
 SetTimer  :: (hwnd: HWND, nIDEvent: u64, uElapse: u32, lpTimerFunc: TIMERPROC) -> u64 #foreign user32;
 
 SetCursorPos :: (x: s32, y: s32) -> BOOL #foreign user32;
+
+MA_ACTIVATEANDEAT : LRESULT : 2;

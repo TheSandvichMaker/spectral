@@ -1,10 +1,17 @@
 #import "Basic";
 #import "Math";
 #import "Atomics";
+#import "File";
+#import "Thread";
+#import "System";
+#import "Windows";
+#import "Windows_Utf8";
+#import "stb_image";
 
 USE_SAMPLED_SPECTRUM :: true;
 
 #load "windows.jai";
+#load "directx.jai";
 #load "utility.jai";
 #load "random.jai";
 #load "math.jai";
@@ -12,28 +19,33 @@ USE_SAMPLED_SPECTRUM :: true;
 #load "pathtracer.jai";
 
 g_start_time: float64;
-g_time: float;
+
+g_blue_noise1: [8] Bitmap;
+g_blue_noise3: [8] Bitmap;
 
 Bitmap :: struct
 {
     w: int;
     h: int;
+    c: int;
     stride: int;
     data: [] u8;
 }
 
 Accumulation_Buffer :: struct
 {
+    TYPE :: Vector4;
+
     w: int;
     h: int;
     stride: int;
-    data: *Vector3;
+    data: *TYPE;
     frame_count: int = 1;
 }
 
-get_texel :: inline (acc: Accumulation_Buffer, x: int, y: int) -> *Vector3
+get_texel :: inline (acc: Accumulation_Buffer, x: int, y: int) -> *Vector4
 {
-    return cast(*Vector3) (cast(*u8) acc.data + x*size_of(Vector3) + y*acc.stride);
+    return cast(*Vector4) (cast(*u8) acc.data + x*size_of(Vector4) + y*acc.stride);
 }
 
 make_accumulation_buffer :: (w: int, h: int) -> Accumulation_Buffer
@@ -41,9 +53,9 @@ make_accumulation_buffer :: (w: int, h: int) -> Accumulation_Buffer
     acc: Accumulation_Buffer;
     acc.w      = w;
     acc.h      = h;
-    acc.stride = size_of(Vector3)*acc.w;
-    acc.data   = alloc(size_of(Vector3)*acc.w*acc.h);
-    memset(acc.data, 0, size_of(Vector3)*acc.w*acc.h);
+    acc.stride = size_of(acc.TYPE)*acc.w;
+    acc.data   = alloc(size_of(acc.TYPE)*acc.w*acc.h);
+    memset(acc.data, 0, size_of(acc.TYPE)*acc.w*acc.h);
     return acc;
 }
 
@@ -59,7 +71,7 @@ resize :: (acc: *Accumulation_Buffer, w: int, h: int)
 reset :: (acc: *Accumulation_Buffer)
 {
     acc.frame_count = 1;
-    memset(acc.data, 0, size_of(Vector3)*acc.w*acc.h);
+    memset(acc.data, 0, size_of(acc.TYPE)*acc.w*acc.h);
 }
 
 Shared_Render_Data :: struct
@@ -69,8 +81,6 @@ Shared_Render_Data :: struct
 
     tiles_to_consume: s64;
     tiles_unfinished: s64;
-
-    frame_index: int;
 
     camera: Camera;
     scene: *Scene;
@@ -178,7 +188,7 @@ render_thread :: (thread: *Thread) -> s64
             tile.x1 = min(tile.x0 + TILE_SIZE, accumulation_buffer.w);
             tile.y1 = min(tile.y0 + TILE_SIZE, accumulation_buffer.h);
 
-            render_scene(camera, scene, accumulation_buffer, tile, data.shared.frame_index);
+            render_scene(camera, scene, accumulation_buffer, tile);
 
             atomic_decrement(*data.shared.tiles_unfinished);
         }
@@ -195,12 +205,17 @@ main :: ()
     // Windows is very bad at thread-switching by default unless you do this. Sad.
     timeBeginPeriod(1);
 
-    render_w := 480;
-    render_h := 360;
+    window_w: u32 = 1280;
+    window_h: u32 = 1024;
+    render_w: u32 = 320;
+    render_h: u32 = 256;
+
+    hwnd: HWND;
 
     {
-        success, error_message := init_window(render_w, render_h);
-        if !success
+        error_message: string;
+        hwnd, error_message = init_window(window_w, window_h);
+        if !hwnd
         {
             error_box(error_message);
             return;
@@ -208,7 +223,7 @@ main :: ()
     }
 
     {
-        success, error_message := init_d3d();
+        success, error_message := init_d3d(hwnd, render_w, render_h);
         if !success  
         {
             error_box(error_message);
@@ -216,14 +231,14 @@ main :: ()
         }
     }
 
-    input: Input;
+    init_assets();
 
-    camera: Camera;
-    scene: Scene;
+    input  : Input;
+    camera : Camera;
+    scene  : Scene;
     init_scene(*camera, *scene);
 
     shared_data: Shared_Render_Data;
-    shared_data.frame_index = 1;
     shared_data.camera = camera;
     shared_data.scene = *scene;
 
@@ -289,6 +304,13 @@ main :: ()
                         SetCapture(hwnd);
                         ShowCursor(0);
                         ClipCursor(*screen_rect);
+
+                        mid_point: POINT;
+                        mid_point.x = (client_rect.left + client_rect.right) / 2;
+                        mid_point.y = (client_rect.bottom + client_rect.top) / 2;
+
+                        ClientToScreen(hwnd, *mid_point);
+                        SetCursorPos(mid_point.x, mid_point.y);
                     }
 
                 case WM_KEYUP;      #through;
@@ -300,12 +322,12 @@ main :: ()
 
                     if vk_code ==
                     {
-                        case #char "W";  handle_button_press(*input.move_forward, pressed);
-                        case #char "A";  handle_button_press(*input.move_left, pressed);
-                        case #char "S";  handle_button_press(*input.move_back, pressed);
-                        case #char "D";  handle_button_press(*input.move_right, pressed);
-                        case VK_SPACE;   handle_button_press(*input.move_up, pressed);
-                        case VK_CONTROL; handle_button_press(*input.move_down, pressed);
+                        case #char "W";  if cursor_locked  handle_button_press(*input.move_forward, pressed);
+                        case #char "A";  if cursor_locked  handle_button_press(*input.move_left, pressed);
+                        case #char "S";  if cursor_locked  handle_button_press(*input.move_back, pressed);
+                        case #char "D";  if cursor_locked  handle_button_press(*input.move_right, pressed);
+                        case VK_SPACE;   if cursor_locked  handle_button_press(*input.move_up, pressed);
+                        case VK_CONTROL; if cursor_locked  handle_button_press(*input.move_down, pressed);
 
                         case VK_ESCAPE;
                             if cursor_locked
@@ -323,8 +345,8 @@ main :: ()
             }
         }
 
-        render_w = xx (client_rect.right - client_rect.left);
-        render_h = xx (client_rect.bottom - client_rect.top);
+        window_w = xx (client_rect.right - client_rect.left);
+        window_h = xx (client_rect.bottom - client_rect.top);
 
         cursor_delta_x: int;
         cursor_delta_y: int;
@@ -349,6 +371,8 @@ main :: ()
         input.cursor_delta_x = cursor_delta_x;
         input.cursor_delta_y = cursor_delta_y;
 
+        camera = update_camera(camera, input, 1.0 / 60.0);
+
         if atomic_read(*shared_data.tiles_unfinished) == 0
         {
             AcquireSRWLockExclusive(*shared_data.render_lock);
@@ -357,7 +381,7 @@ main :: ()
             render_time := render_end_time - render_start_time;
             render_start_time = render_end_time;
 
-            resized := maybe_resize_textures(render_w, render_h);
+            resized := maybe_resize_textures(window_w, window_h, render_w, render_h);
             if resized
             {
                 resize(*accumulation_buffer, render_w, render_h);
@@ -367,9 +391,21 @@ main :: ()
             resolve_accumulation_buffer(*accumulation_buffer);
             accumulation_buffer.frame_count += 1;
 
-            if updated_camera
+            // ----------------------------------------------------
+
+            shared_data.scene.dt = 1.0 / 60.0;
+            shared_data.scene.time += shared_data.scene.dt;
+
+            shared_data.camera = camera;
+            shared_data.accumulation_buffer = *accumulation_buffer;
+            shared_data.scene.frame_index += 1;
+
+            // update_scene(shared_data.scene);
+
+            if scene_dirty
             {
-                updated_camera = false;
+                scene_dirty = false;
+                shared_data.scene.frame_index = 0;
                 reset(*accumulation_buffer);
             }
 
@@ -377,22 +413,26 @@ main :: ()
             tile_count_y := (accumulation_buffer.h + TILE_SIZE - 1) / TILE_SIZE;
             tile_count_total := tile_count_x*tile_count_y;
 
-            shared_data.camera = update_camera(shared_data.camera, input, 1.0 / 60.0);
-            shared_data.accumulation_buffer = *accumulation_buffer;
-
-            g_time = cast(float) (get_time() - g_start_time);
-
-            shared_data.frame_index += 1;
-
             shared_data.tiles_unfinished = tile_count_total;
             atomic_write(*shared_data.tiles_to_consume, tile_count_total); // writing this last because it's the state we check to mitigate spurious wake-ups
 
             ReleaseSRWLockExclusive(*shared_data.render_lock);
             WakeAllConditionVariable(*shared_data.render_cond);
 
+            // ----------------------------------------------------
+
             title := tprint("render time: %ms\n", 1000.0*render_time);
             SetWindowTextW(hwnd, utf8_to_wide(title));
         }
+
+        immediate_set_ndc_space();
+
+        immediate_quad(0.20, 0.20, 0.80, 0.80, make_vector4(1, 0, 1, 1));
+        immediate_flush();
+
+        immediate_bind_texture(get_scene_texture());
+        immediate_quad(0.25, 0.25, 0.75, 0.75, make_vector4(1, 1, 1, 1));
+        immediate_flush();
 
         present();
 
@@ -402,15 +442,71 @@ main :: ()
 
 #scope_file
 
+load_bitmap :: (path: string, channels: int) -> Bitmap
+{
+    w: s32;
+    h: s32;
+    c: s32;
+    pixels := stbi_load(temp_c_string(path), *w, *h, *c, xx channels);
+
+    bitmap: Bitmap;
+    bitmap.w          = w;
+    bitmap.h          = h;
+    bitmap.c          = channels;
+    bitmap.stride     = w*channels;
+    bitmap.data.data  = pixels;
+    bitmap.data.count = bitmap.stride*bitmap.h;
+
+    return bitmap;
+}
+
+free_bitmap :: (bitmap: *Bitmap)
+{
+    free(bitmap.data.data);
+    memset(bitmap, 0, size_of(Bitmap));
+}
+
+init_assets :: ()
+{
+    g_blue_noise1[0] = load_bitmap("textures/noise/LDR_LLL1_0.png", 1);
+    g_blue_noise1[1] = load_bitmap("textures/noise/LDR_LLL1_1.png", 1);
+    g_blue_noise1[2] = load_bitmap("textures/noise/LDR_LLL1_2.png", 1);
+    g_blue_noise1[3] = load_bitmap("textures/noise/LDR_LLL1_3.png", 1);
+    g_blue_noise1[4] = load_bitmap("textures/noise/LDR_LLL1_4.png", 1);
+    g_blue_noise1[5] = load_bitmap("textures/noise/LDR_LLL1_5.png", 1);
+    g_blue_noise1[6] = load_bitmap("textures/noise/LDR_LLL1_6.png", 1);
+    g_blue_noise1[7] = load_bitmap("textures/noise/LDR_LLL1_7.png", 1);
+
+    g_blue_noise3[0] = load_bitmap("textures/noise/LDR_RGB1_0.png", 3);
+    g_blue_noise3[1] = load_bitmap("textures/noise/LDR_RGB1_1.png", 3);
+    g_blue_noise3[2] = load_bitmap("textures/noise/LDR_RGB1_2.png", 3);
+    g_blue_noise3[3] = load_bitmap("textures/noise/LDR_RGB1_3.png", 3);
+    g_blue_noise3[4] = load_bitmap("textures/noise/LDR_RGB1_4.png", 3);
+    g_blue_noise3[5] = load_bitmap("textures/noise/LDR_RGB1_5.png", 3);
+    g_blue_noise3[6] = load_bitmap("textures/noise/LDR_RGB1_6.png", 3);
+    g_blue_noise3[7] = load_bitmap("textures/noise/LDR_RGB1_7.png", 3);
+}
+
 init_scene :: (camera: *Camera, scene: *Scene)
 {
     camera.p = make_vector3(0, 5, -15);
     camera.d = normalize(make_vector3(0, 0, 0) - camera.p);
     camera.fov = 60.0;
 
-    red   := add_material(scene, .{ color = .{ 1, 0, 0 } });
-    green := add_material(scene, .{ color = .{ 0, 1, 0 } });
-    blue  := add_material(scene, .{ color = .{ 0, 0, 1 } });
+    scene.sky_top = 1.5*make_vector3(0.2, 0.3, 0.8);
+    scene.sky_bot = 1.5*make_vector3(0.5, 0.7, 0.9);
+
+    light := add_material(scene, .{ kind = .Emissive, color = .{ 25, 20.5, 15 } });
+    red   := add_material(scene, .{ ior = 2.1, color = .{ 1, 0, 0 } });
+    green := add_material(scene, .{ ior = 1.5, color = .{ 0, 1, 0 } });
+    blue  := add_material(scene, .{ ior = 1.5, color = .{ 0, 0, 1 } });
+
+    light_sphere: Sphere;
+    light_sphere.p = make_vector3(3, 10, 2);
+    light_sphere.r = 3.0;
+    light_sphere.material_index = light;
+    
+    add_primitive(scene, light_sphere);
 
     sphere: Sphere;
     sphere.p = make_vector3(0, 0, 0);
@@ -428,13 +524,22 @@ init_scene :: (camera: *Camera, scene: *Scene)
 
     plane: Plane;
     plane.n = make_vector3(0, 1, 0);
-    plane.d = -8.0;
+    plane.p = make_vector3(0, -8.0, 0);
     plane.material_index = blue;
 
     add_primitive(scene, plane);
 }
 
-updated_camera := false;
+update_scene :: (using scene: *Scene)
+{
+    scene_dirty = true;
+
+    new_x := 10.0*sin(2.0*time);
+    spheres[0].dp.x = (new_x - spheres[0].p.x) / dt;
+    spheres[0]. p.x = new_x;
+}
+
+scene_dirty := false;
 
 update_camera :: (camera_: Camera, input: Input, dt: float) -> Camera
 {
@@ -462,21 +567,20 @@ update_camera :: (camera_: Camera, input: Input, dt: float) -> Camera
     turn_delta += x*cast(float) input.cursor_delta_x;
     turn_delta -= y*cast(float) input.cursor_delta_y;
 
+    camera.prev_d = camera.d;
     camera.d += dt*turn_speed*turn_delta;
     camera.d = normalize(camera.d);
 
     if length(move_delta) > 0.0 ||
        length(turn_delta) > 0.0
     {
-        updated_camera = true;
+        scene_dirty = true;
     }
 
     return camera;
 }
 
 // win32
-
-hwnd: HWND;
 
 window_proc :: (hWnd: HWND, message: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT #c_call 
 {
@@ -486,15 +590,18 @@ window_proc :: (hWnd: HWND, message: u32, wParam: WPARAM, lParam: LPARAM) -> LRE
     { 
         case WM_DESTROY;
             PostQuitMessage(0); 
+
+        case WM_MOUSEACTIVATE;
+            return MA_ACTIVATEANDEAT;
      
-         case; 
+        case; 
             return DefWindowProcW(hWnd, message, wParam, lParam); 
     } 
  
     return 0; 
 } 
 
-init_window :: (w: int, h: int) -> success: bool, error_message: string
+init_window :: (w: int, h: int) -> hwnd: HWND, error_message: string
 {
     window_class: WNDCLASSEXW;
     window_class.cbSize        = size_of(WNDCLASSEXW);
@@ -508,7 +615,7 @@ init_window :: (w: int, h: int) -> success: bool, error_message: string
 
     if !RegisterClassExW(*window_class)
     {
-        return false, "Failed to register window class";
+        return null, "Failed to register window class";
     }
 
     window_rect: RECT;
@@ -519,21 +626,21 @@ init_window :: (w: int, h: int) -> success: bool, error_message: string
 
     AdjustWindowRect(*window_rect, WS_OVERLAPPEDWINDOW, BOOL.FALSE);
 
-    hwnd = CreateWindowExW(0, utf8_to_wide("SpectralWindowClass"), utf8_to_wide("Spectral Pathtracer"),
-                           WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 
-                           window_rect.right - window_rect.left,
-                           window_rect.bottom - window_rect.top,
-                           null, null, null, null);
+    hwnd := CreateWindowExW(0, utf8_to_wide("SpectralWindowClass"), utf8_to_wide("Spectral Pathtracer"),
+                            WS_OVERLAPPEDWINDOW,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 
+                            window_rect.right - window_rect.left,
+                            window_rect.bottom - window_rect.top,
+                            null, null, null, null);
 
     if !hwnd
     {
-        return false, "Failed to create window";
+        return null, "Failed to create window";
     }
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
 
-    return true, "";
+    return hwnd, "";
 }
 
 error_box :: (message: string)
@@ -565,403 +672,3 @@ client_to_screen :: (hwnd: HWND, rect: RECT) -> RECT
 
     return result;
 }
-
-// d3d11
-
-D3D_State :: struct
-{
-    driver_type   := D3D_DRIVER_TYPE.NULL;
-    feature_level := D3D_FEATURE_LEVEL._11_0;
-
-    device                         : *ID3D11Device;
-    device_context                 : *ID3D11DeviceContext;
-    swap_chain                     : *IDXGISwapChain1;
-
-    nearest_neighbour_sampler      : *ID3D11SamplerState;
-
-    fullscreen_vs                  : *ID3D11VertexShader;
-    resolve_accumulation_buffer_cb : *ID3D11Buffer;
-    resolve_accumulation_buffer_ps : *ID3D11PixelShader;
-
-    accumulation_buffer            : *ID3D11Texture2D;
-    accumulation_buffer_srv        : *ID3D11ShaderResourceView;
-
-    target_texture                 : *ID3D11Texture2D;
-    target_texture_srv             : *ID3D11ShaderResourceView;
-    target_texture_rtv             : *ID3D11RenderTargetView;
-
-    back_buffer                    : *ID3D11Texture2D;
-    back_buffer_rtv                : *ID3D11RenderTargetView;
-
-    viewport                       : D3D11_VIEWPORT;
-
-    display_w: DWORD;
-    display_h: DWORD;
-}
-
-d3d: D3D_State;
-
-Resolve_Accumulation_Buffer_PS_Parameters :: struct
-{
-    frame_count: float;
-    padding0: float;
-    padding1: float;
-    padding2: float;
-}
-
-compile_shader :: (source: string, entry_point: string, shader_model: string) -> string, HRESULT
-{
-    flags := D3DCOMPILE.ENABLE_STRICTNESS;
-
-    #if DEBUG
-    {
-        flags |= .DEBUG;
-        flags |= .SKIP_OPTIMIZATION;
-    }
-
-    bytecode, errors, hr := D3DCompile(source, "source", .[], null, entry_point, shader_model, xx flags, 0);
-    defer free(errors);
-
-    if FAILED(hr)
-    {
-        free(bytecode);
-        if errors  print("Shader compilation error: %\n", errors, to_standard_error=true);
-        return "", hr;
-    }
-
-    return bytecode, hr;
-}
-
-init_d3d :: () -> success: bool, error_message: string
-{
-    hr: HRESULT;
-
-    flags: D3D11_CREATE_DEVICE_FLAG;
-    flags |= .DEBUG;
-
-    driver_types   := D3D_DRIVER_TYPE.[.HARDWARE, .WARP, .REFERENCE];
-    feature_levels := D3D_FEATURE_LEVEL.[._11_1, ._11_0, ._10_1, ._10_0];
-
-    base_device: *ID3D11Device;
-    base_device_context: *ID3D11DeviceContext;
- 
-    for 0..driver_types.count-1 
-    {
-        d3d.driver_type = driver_types[it]; 
-        hr = D3D11CreateDevice(null, d3d.driver_type, null, flags, feature_levels.data, feature_levels.count, D3D11_SDK_VERSION, *d3d.device, *d3d.feature_level, *d3d.device_context);
- 
-        if hr == E_INVALIDARG 
-        {
-            // DirectX 11.0 platforms will not recognize D3D_FEATURE_LEVEL_11_1 so we need to retry without it.
-            hr = D3D11CreateDevice(null, d3d.driver_type, null, flags, feature_levels.data + 1, feature_levels.count - 1, D3D11_SDK_VERSION, *d3d.device, *d3d.feature_level, *d3d.device_context);
-        }
- 
-        if SUCCEEDED(hr)  break;
-    } 
-
-    dxgi_factory: *IDXGIFactory2;
-    {
-        dxgi_device: *IDXGIDevice;
-        dxgi_adapter: *IDXGIAdapter;
-
-        hr = IUnknown_QueryInterface(d3d.device, *uid(IDXGIDevice1_UUID), xx *dxgi_device);
-        if FAILED(hr)  return false, "Failed to query IDXGIDevice1 interface";
-
-        hr = IDXGIDevice_GetAdapter(dxgi_device, xx *dxgi_adapter);
-        if FAILED(hr)  return false, "Failed to get device adapater";
-
-        hr = IDXGIObject_GetParent(dxgi_adapter, *uid(IDXGIFactory2_UUID), xx *dxgi_factory);
-        if FAILED(hr)  return false, "Failed to get adapter parent factory";
-
-        IUnknown_Release(dxgi_adapter);
-        IUnknown_Release(dxgi_device);
-    }
-
-    rect: RECT;
-    GetClientRect(hwnd, *rect);
-
-    w: u32 = xx (rect.right - rect.left);
-    h: u32 = xx (rect.bottom - rect.top);
-
-    {
-        sd: DXGI_SWAP_CHAIN_DESC1;
-        sd.Width              = w;
-        sd.Height             = h;
-        sd.Format             = .R8G8B8A8_UNORM;
-        sd.SampleDesc.Count   = 1;
-        sd.SampleDesc.Quality = 0;
-        sd.BufferUsage        = .RENDER_TARGET_OUTPUT;
-        sd.BufferCount        = 2;
-        sd.Scaling            = .NONE;
-        sd.SwapEffect         = .FLIP_SEQUENTIAL;
-        sd.AlphaMode          = .UNSPECIFIED;
-        hr = IDXGIFactory2_CreateSwapChainForHwnd(dxgi_factory, d3d.device, hwnd, *sd, null, null, *d3d.swap_chain);
-        if FAILED(hr)  return false, "Failed to create swap chain";
-    }
-
-    {
-        success, message := create_textures(w, h);
-        if !success  return false, message;
-    }
-
-    {
-        d3d.viewport.Width  = xx w;
-        d3d.viewport.Height = xx h;
-        d3d.viewport.MinDepth = 0.0;
-        d3d.viewport.MaxDepth = 1.0;
-        d3d.viewport.TopLeftX = 0.0;
-        d3d.viewport.TopLeftY = 0.0;
-        ID3D11DeviceContext_RSSetViewports(d3d.device_context, 1, *d3d.viewport);
-    }
-
-    {
-        desc: D3D11_SAMPLER_DESC;
-        desc.Filter         = .MIN_MAG_MIP_POINT;
-        desc.AddressU       = .CLAMP;
-        desc.AddressV       = .CLAMP;
-        desc.AddressW       = .CLAMP;
-        desc.MaxAnisotropy  = 1;
-        desc.ComparisonFunc = .ALWAYS;
-        hr = ID3D11Device_CreateSamplerState(d3d.device, *desc, *d3d.nearest_neighbour_sampler);
-        if FAILED(hr)  return false, "Failed to create sampler state";
-    }
-
-    shader_text := read_entire_file("shaders/shaders.hlsl");
-
-    {
-        vs: string;
-        vs, hr = compile_shader(shader_text, "fullscreen_vs", "vs_4_0");
-        defer free(vs);
-        if FAILED(hr)  return false, "Failed to compile vertex shader";
-
-        hr = ID3D11Device_CreateVertexShader(d3d.device, vs.data, xx vs.count, null, *d3d.fullscreen_vs);
-        if FAILED(hr)  return false, "Failed to create vertex shader";
-    }
-
-    {
-        ps: string;
-        ps, hr = compile_shader(shader_text, "resolve_accumulation_buffer_ps", "ps_4_0");
-        defer free(ps);
-        if FAILED(hr)  return false, "Failed to compile pixel shader";
-
-        hr = ID3D11Device_CreatePixelShader(d3d.device, ps.data, xx ps.count, null, *d3d.resolve_accumulation_buffer_ps);
-        if FAILED(hr)  return false, "Failed to create pixel shader";
-    }
-
-    {
-        desc: D3D11_BUFFER_DESC;
-        desc.ByteWidth      = size_of(Resolve_Accumulation_Buffer_PS_Parameters);
-        desc.Usage          = .DYNAMIC;
-        desc.BindFlags      = .CONSTANT_BUFFER;
-        desc.CPUAccessFlags = .WRITE;
-
-        data: Resolve_Accumulation_Buffer_PS_Parameters;
-        init_data: D3D11_SUBRESOURCE_DATA;
-        init_data.pSysMem = *data;
-
-        hr = ID3D11Device_CreateBuffer(d3d.device, *desc, *init_data, *d3d.resolve_accumulation_buffer_cb);
-        if FAILED(hr)  return false, "Failed to create constant buffer";
-    }
-
-    return true, "";
-}
-
-release_textures :: ()
-{
-    checked_release(xx *d3d.accumulation_buffer);
-    checked_release(xx *d3d.accumulation_buffer_srv);
-    checked_release(xx *d3d.target_texture);
-    checked_release(xx *d3d.target_texture_srv);
-    checked_release(xx *d3d.target_texture_rtv);
-    checked_release(xx *d3d.back_buffer);
-    checked_release(xx *d3d.back_buffer_rtv);
-}
-
-create_textures :: (w: u32, h: u32) -> bool, string
-{
-    release_textures();
-
-    hr: HRESULT;
-
-    d3d.viewport.Width  = xx w;
-    d3d.viewport.Height = xx h;
-    d3d.viewport.MinDepth = 0.0;
-    d3d.viewport.MaxDepth = 1.0;
-    d3d.viewport.TopLeftX = 0.0;
-    d3d.viewport.TopLeftY = 0.0;
-
-    {
-        tex_desc: D3D11_TEXTURE2D_DESC;
-        tex_desc.Width              = w;
-        tex_desc.Height             = h;
-        tex_desc.MipLevels          = 1;
-        tex_desc.ArraySize          = 1;
-        tex_desc.Format             = .R32G32B32_FLOAT;
-        tex_desc.SampleDesc.Count   = 1;
-        tex_desc.SampleDesc.Quality = 0;
-        tex_desc.Usage              = .DYNAMIC;
-        tex_desc.BindFlags          = .SHADER_RESOURCE;
-        tex_desc.CPUAccessFlags     = .WRITE;
-
-        hr = ID3D11Device_CreateTexture2D(d3d.device, *tex_desc, null, *d3d.accumulation_buffer);
-        if FAILED(hr)  return false, "Failed to create accumulation buffer";
-
-        hr = ID3D11Device_CreateShaderResourceView(d3d.device, d3d.accumulation_buffer, null, *d3d.accumulation_buffer_srv);
-        if FAILED(hr)  return false, "Failed to create target texture srv";
-    }
-
-    {
-        tex_desc: D3D11_TEXTURE2D_DESC;
-        tex_desc.Width              = w;
-        tex_desc.Height             = h;
-        tex_desc.MipLevels          = 1;
-        tex_desc.ArraySize          = 1;
-        tex_desc.Format             = .R8G8B8A8_UNORM_SRGB;
-        tex_desc.SampleDesc.Count   = 1;
-        tex_desc.SampleDesc.Quality = 0;
-        tex_desc.Usage              = .DEFAULT;
-        tex_desc.BindFlags          = D3D11_BIND_FLAG.RENDER_TARGET|.SHADER_RESOURCE;
-        tex_desc.CPUAccessFlags     = .WRITE;
-
-        hr = ID3D11Device_CreateTexture2D(d3d.device, *tex_desc, null, *d3d.target_texture);
-        if FAILED(hr)  return false, "Failed to create target texture";
-
-        hr = ID3D11Device_CreateShaderResourceView(d3d.device, d3d.target_texture, null, *d3d.target_texture_srv);
-        if FAILED(hr)  return false, "Failed to create target texture srv";
-
-        hr = ID3D11Device_CreateRenderTargetView(d3d.device, d3d.target_texture, null, *d3d.target_texture_rtv);
-        if FAILED(hr)  return false, "Failed to create target texture rtv";
-    }
-
-    hr = IDXGISwapChain_GetBuffer(d3d.swap_chain, 0, *uid(ID3D11Texture2D_UUID), xx *d3d.back_buffer);
-    if FAILED(hr)  return false, "Failed to get backbuffer";
-
-    hr = ID3D11Device_CreateRenderTargetView(d3d.device, d3d.back_buffer, null, *d3d.back_buffer_rtv);
-    if FAILED(hr)  return false, "Failed to create backbuffer rtv";
-
-    return true, "";
-}
-
-maybe_resize_textures :: (w_: int, h_: int) -> bool
-{
-    w: u32 = xx w_;
-    h: u32 = xx h_;
-
-    hr: HRESULT;
-
-    if w != d3d.display_w ||
-       h != d3d.display_h
-    {
-        release_textures();
-
-        d3d.display_w = w;
-        d3d.display_h = h;
-
-        if w && h
-        {
-            hr = IDXGISwapChain_ResizeBuffers(d3d.swap_chain, 2, w, h, .R8G8B8A8_UNORM, 0);
-            if always(SUCCEEDED(hr))
-            {
-                success, message := create_textures(w, h);
-                if !success
-                {
-                    print("What the heck: %\n", message, to_standard_error=true);
-                }
-            }
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-resolve_accumulation_buffer :: (acc: *Accumulation_Buffer)
-{
-    {
-        mapped: D3D11_MAPPED_SUBRESOURCE;
-        hr := ID3D11DeviceContext_Map(d3d.device_context, d3d.resolve_accumulation_buffer_cb, 0, .WRITE_DISCARD, 0, *mapped);
-
-        if always(SUCCEEDED(hr))
-        {
-            parameters := cast(*Resolve_Accumulation_Buffer_PS_Parameters) mapped.pData;
-            parameters.frame_count = cast(float) acc.frame_count;
-
-            ID3D11DeviceContext_Unmap(d3d.device_context, d3d.resolve_accumulation_buffer_cb, 0);
-        }
-    }
-
-    {
-        mapped: D3D11_MAPPED_SUBRESOURCE;
-
-        hr := ID3D11DeviceContext_Map(d3d.device_context, d3d.accumulation_buffer, 0, .WRITE_DISCARD, 0, *mapped);
-        if always(SUCCEEDED(hr))
-        {
-            dst := mapped.pData;
-
-            if mapped.RowPitch == acc.stride
-            {
-                memcpy(dst, acc.data, size_of(Vector3)*acc.w*acc.h);
-            }
-            else
-            {
-                for y: 0..acc.h-1
-                {
-                    memcpy(dst, acc.data + y*acc.stride, acc.stride);
-                    dst += mapped.RowPitch;
-                }
-            }
-
-            ID3D11DeviceContext_Unmap(d3d.device_context, d3d.accumulation_buffer, 0);
-        }
-    }
-
-    ID3D11DeviceContext_OMSetRenderTargets(d3d.device_context, 1, *d3d.back_buffer_rtv, null);
-    ID3D11DeviceContext_RSSetViewports(d3d.device_context, 1, *d3d.viewport);
-    ID3D11DeviceContext_IASetPrimitiveTopology(d3d.device_context, D3D11_PRIMITIVE_TOPOLOGY.TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(d3d.device_context, d3d.fullscreen_vs, null, 0);
-    ID3D11DeviceContext_PSSetShader(d3d.device_context, d3d.resolve_accumulation_buffer_ps, null, 0);
-    ID3D11DeviceContext_PSSetSamplers(d3d.device_context, 0, 1, *d3d.nearest_neighbour_sampler);
-    ID3D11DeviceContext_PSSetShaderResources(d3d.device_context, 0, 1, *d3d.accumulation_buffer_srv);
-    ID3D11DeviceContext_PSSetConstantBuffers(d3d.device_context, 0, 1, *d3d.resolve_accumulation_buffer_cb);
-    ID3D11DeviceContext_Draw(d3d.device_context, 3, 0);
-}
-
-present :: ()
-{
-    // ID3D11DeviceContext_CopyResource(d3d.device_context, d3d.back_buffer, d3d.target_texture);
-
-    hr := IDXGISwapChain_Present(d3d.swap_chain, 1, 0);
-    if hr == DXGI_STATUS_OCCLUDED
-    {
-        // window is not visible, so no vsync is possible,
-        // sleep a bit instead.
-        Sleep(16);
-    }
-    else
-    {
-        assert(SUCCEEDED(hr));
-    }
-}
-
-checked_release :: (ptr: **IUnknown)
-{
-    if <<ptr
-    {
-        IUnknown_Release(<<ptr);
-        <<ptr = null;
-    }
-}
-
-//
-//
-//
-
-#import "File";
-#import "Thread";
-#import "System";
-#import "Windows";
-#import "Windows_Utf8";
-#import "d3d11"()(INCLUDE_DEBUG_BINDINGS = true);
-#import "d3d_compiler";
-#import "dxgi";

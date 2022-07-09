@@ -61,6 +61,23 @@ random_range :: (r: *Random_Series, min: float, max: float) -> float
     return result;
 }
 
+random_unilateral2 :: inline (r: *Random_Series) -> Vector2
+{
+    result: Vector2 = ---;
+    result.x = random_unilateral(r);
+    result.y = random_unilateral(r);
+    return result;
+}
+
+random_unilateral3 :: inline (r: *Random_Series) -> Vector3
+{
+    result: Vector3 = ---;
+    result.x = random_unilateral(r);
+    result.y = random_unilateral(r);
+    result.z = random_unilateral(r);
+    return result;
+}
+
 random_in_unit_square :: (r: *Random_Series) -> Vector2
 {
     result: Vector2 = ---;
