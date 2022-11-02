@@ -2,12 +2,15 @@
 
 #run
 {
+    shared_options := get_build_options();
+    shared_options.import_path            = .[ "src/modules", "C:/jai/modules", ];
+    shared_options.output_path            = "run";
+
     {
         w := compiler_create_workspace("Debug");
 
-        options := get_build_options();
+        options := shared_options;
         options.output_executable_name = "spectral_debug";
-        options.output_path            = "run";
         options.optimization_level     = .DEBUG;
 
         set_build_options(options, w);
@@ -19,12 +22,12 @@
     {
         w := compiler_create_workspace("Release");
 
-        options := get_build_options();
-        options.output_executable_name = "spectral";
-        options.output_path            = "run";
-        options.optimization_level     = .RELEASE;
-        options.array_bounds_check     = .OFF;
-        options.cast_bounds_check      = .OFF;
+        options := shared_options;
+        options.output_executable_name  = "spectral";
+        options.array_bounds_check      = .OFF;
+        options.cast_bounds_check       = .OFF;
+        options.enable_bytecode_inliner = true;
+        options.optimization_level      = .RELEASE;
 
         options.llvm_options.code_gen_optimization_level = 2;
         options.llvm_options.disable_inlining            = false;

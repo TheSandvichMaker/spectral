@@ -1,3 +1,25 @@
+RectF32 :: struct
+{
+    x0: float;
+    y0: float;
+    x1: float;
+    y1: float;
+
+#place x0;
+    min: Vector2;
+
+#place x1;
+    max: Vector2;
+}
+
+RectS32 :: struct
+{
+    x0: s32;
+    y0: s32;
+    x1: s32;
+    y1: s32;
+}
+
 frac :: inline (x: float) -> float #must
 {
     return x - floor(x);
@@ -19,7 +41,7 @@ sign_of :: inline(x: float) -> float #must
     else         return -1.0;
 }
 
-square_root :: inline (input: float) -> float #must
+square_root :: (input: float) -> float #must
 {
     input_addr := *input;
 
@@ -35,18 +57,15 @@ square_root :: inline (input: float) -> float #must
     return result;
 }
 
-operator / :: (a: Vector3, b: Vector3) -> Vector3 #must
-{
-    result: Vector3 = ---;
-    result.x = a.x / b.x;
-    result.y = a.y / b.y;
-    result.z = a.z / b.z;
-    return result;
-}
-
 reflect :: inline (v: Vector3, n: Vector3) -> Vector3 #must
 {
     return v - n*dot(v, n)*2;
+}
+
+refract :: inline (d: Vector3, n: Vector3, cos_theta_i: float, cos_theta_t: float, eta_i_over_eta_t: float) -> Vector3
+{
+    result := eta_i_over_eta_t*d + n*(eta_i_over_eta_t*cos_theta_i - cos_theta_t);
+    return result;
 }
 
 Transform :: struct
@@ -123,5 +142,35 @@ map_to_cosine_weighted_hemisphere :: (sample: Vector2) -> Vector3
     result.y = square_root(y);
     result.z = sin(azimuth)*a;
 
+    return result;
+}
+
+view_matrix :: (x: Vector3, y: Vector3, z: Vector3, p: Vector3) -> Matrix4
+{
+    result := make_matrix_from_rows(x, y, z);
+    result  = translate(result, -p);
+    return result;
+}
+
+view_matrix :: (p: Vector3, d: Vector3, up := WORLD_UP) -> Matrix4
+{
+    x, y, z := basis_vectors(d, up);
+    return view_matrix(x, y, z, p);
+}
+
+projection_matrix :: (vfov_in_degrees: float, aspect_ratio: float, near_plane: float) -> Matrix4
+{
+    g := 1.0 / tan(to_radians(0.5*vfov_in_degrees));
+    s := aspect_ratio;
+    n := near_plane;
+
+    e := 0.000001;
+
+    result := make_matrix4(
+        g/s, 0, 0, 0,
+        0,   g, 0, 0,
+        0,   0, e, n*(1-e),
+        0,   0,-1, 0,
+    );
     return result;
 }

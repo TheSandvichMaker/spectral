@@ -7,11 +7,27 @@ struct VS_Output
     float2 texcoord : TEXCOORD;
 };
 
+// 000      & 2 == 00
+// 001      & 2 == 00
+// 010      & 2 == 10
+
+// 000 << 1 & 2 == 00
+// 001 << 1 & 2 == 10
+// 100 << 1 & 2 == 00
+
+// uint2(0, 0)
+// uint2(0, 2)
+// uint2(2, 0)
+
+// -1  1
+// -1 -1
+//  1  1
+
 VS_Output fullscreen_vs(uint id : SV_VertexID) 
 {
     VS_Output OUT;
-    OUT.texcoord = uint2(id << 1, id) & 2;
-    OUT.position = float4(OUT.texcoord*float2(2, -2) + float2(-1, 1), 0, 1);
+    OUT.texcoord = uint2(id, id << 1) & 2;
+    OUT.position = float4(lerp(float2(-1, 1), float2(1, -1), OUT.texcoord), 0, 1);
     return OUT;
 }
 
@@ -64,7 +80,7 @@ cbuffer Parameters : register(b0)
     float frame_count;
 }
 
-Texture2D<float3> accumulation_buffer : register(t0);
+Texture2D<float4> accumulation_buffer : register(t0);
 sampler samp : register(s0);
 
 float3 linear_to_srgb(float3 c)
@@ -84,9 +100,17 @@ float3 tonemap(float3 c)
     return 1.0 - exp(-c);
 }
 
-float4 resolve_accumulation_buffer_ps(VS_Output IN) : SV_Target 
+struct PS_Output
 {
-    float3 color = accumulation_buffer.Sample(samp, IN.texcoord);
+    float4 color : SV_Target;
+};
+
+PS_Output resolve_accumulation_buffer_ps(VS_Output IN)
+{
+    float4 sample = accumulation_buffer.Sample(samp, IN.texcoord);
+    float3 color = sample.rgb;
+    float  depth = sample.a;
+
     color /= frame_count;
 
     float4 r0f = hash43n(float3(IN.texcoord, fmod(frame_count, 1024)));
@@ -94,12 +118,15 @@ float4 resolve_accumulation_buffer_ps(VS_Output IN) : SV_Target
     float4 t = step(0.5/255.0, color.xyzz)*step(color.xyzz, 1.0 - 0.5/255.0);
     rnd += t*(r0f.yzwx - 0.5);
 
-    color.xyz += rnd.xyz / 255.0;
+    color += rnd.xyz / 255.0;
 
     color = ACESFitted(color);
     color = linear_to_srgb(color);
 
-    return float4(color, 1.0);
+    PS_Output OUT;
+    OUT.color = float4(color, depth);
+
+    return OUT;
 }
 
 // --------------------------------------------

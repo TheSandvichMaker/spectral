@@ -36,7 +36,7 @@ Primitive :: struct
 
 Plane :: struct
 {
-    using primitive: Primitive;
+    using #as primitive: Primitive;
     kind = .Plane;
 
     n: Vector3;
@@ -44,7 +44,7 @@ Plane :: struct
 
 Sphere :: struct
 {
-    using primitive: Primitive;
+    using #as primitive: Primitive;
     kind = .Sphere;
 
     r: float;
@@ -52,7 +52,7 @@ Sphere :: struct
 
 Box :: struct
 {
-    using primitive: Primitive;
+    using #as primitive: Primitive;
     kind = .Box;
 
     r: Vector3;
@@ -69,8 +69,8 @@ Camera :: struct
 basis_vectors :: (d: Vector3, up := WORLD_UP) -> x: Vector3, y: Vector3, z: Vector3
 {
     z := -d;
-    x := cross(up, z);
-    y := cross(z, x);
+    x := normalize(cross(up, z));
+    y := normalize(cross(z, x));
     return x, y, z;
 }
 
@@ -81,7 +81,7 @@ Ray :: struct
     inv_d: Vector3;
 }
 
-make_ray :: (o: Vector3, d: Vector3) -> Ray
+make_ray :: inline (o: Vector3, d: Vector3) -> Ray
 {
     ray: Ray;
     ray.o = o;
@@ -90,11 +90,17 @@ make_ray :: (o: Vector3, d: Vector3) -> Ray
     return ray;
 }
 
+transform_depth :: inline (depth: float, near_plane: float) -> float #must
+{
+    return near_plane / depth;
+}
+
 Scene :: struct
 {
-    time        : float;
-    dt          : float;
-    frame_index : int;
+    time              : float;
+    dt                : float;
+    frame_index       : int;
+    total_frame_index : int;
 
     sky_bot: Vector3;
     sky_top: Vector3;
@@ -162,14 +168,6 @@ add_material :: (using scene: *Scene, material: Material) -> s16
     return result;
 }
 
-Tile :: struct
-{
-    x0: int;
-    y0: int;
-    x1: int;
-    y1: int;
-};
-
 sample_blue_noise1 :: (frame_index: int, x: int, y: int) -> float
 {
     bitmap := *g_blue_noise1[frame_index % g_blue_noise1.count];
@@ -195,20 +193,41 @@ sample_blue_noise3 :: (frame_index: int, x: int, y: int) -> Vector3
     g := << (pix + 1);
     b := << (pix + 2);
 
-    PHI :: cast(float)1.618033988;
-
-    offset := cast(float)(frame_index / g_blue_noise3.count) * PHI;
-
     color := make_vector3(
-        frac(offset + cast(float)r * (1.0/255.0)),
-        frac(offset + cast(float)g * (1.0/255.0)),
-        frac(offset + cast(float)b * (1.0/255.0)),
+        cast(float)r * (1.0/255.0),
+        cast(float)g * (1.0/255.0),
+        cast(float)b * (1.0/255.0),
     );
 
     return color;
 }
 
-render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: Tile)
+ray_for_uv :: (camera: Camera, aspect_ratio: float, uv01: Vector2) -> Ray
+{
+    uv := 2.0*uv01 - make_vector2(1, 1);
+
+    film_w := aspect_ratio;
+    film_h := 1.0;
+
+    film_distance := film_h / tan(to_radians(0.5*camera.fov));
+
+    camera_x, camera_y, camera_z := basis_vectors(camera.d);
+
+    p := camera.p;
+
+    film_o := -camera_z * film_distance;
+
+    film_p := film_o;
+    film_p += uv.x*film_w*camera_x;
+    film_p += uv.y*film_h*camera_y;
+
+    d := normalize(film_p);
+
+    r := make_ray(p, d);
+    return r;
+}
+
+render_scene :: (camera: Camera, scene: Scene, acc: Accumulation_Buffer, tile: RectS32)
 {
     w := cast(float) acc.w;
     h := cast(float) acc.h;
@@ -216,35 +235,30 @@ render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: 
     film_w := w / h;
     film_h := 1.0;
 
-    half_film_w := 0.5*film_w;
-    half_film_h := 0.5*film_h;
-
-    inv_half_film_w := 1.0 / half_film_w;
-    inv_half_film_h := 1.0 / half_film_h;
-
     pixel_w := 1.0 / w;
     pixel_h := 1.0 / h;
 
-    film_distance := film_h / tan(to_radians(camera.fov));
+    film_distance := film_h / tan(to_radians(0.5*camera.fov));
 
     random: Random_Series;
-    random.state = xx ((scene.frame_index + 1)*(tile.x1 + 1000*tile.y1));
+    random.state = xx ((scene.total_frame_index + 1)*(tile.x1 + 1000*tile.y1));
 
     for y: tile.y0..tile.y1-1
     {
-        v := 1.0 - 2.0*(cast(float) y / h);
+        v := -1.0 + 2.0*(cast(float) y / h);
 
         for x: tile.x0..tile.x1-1
         {
             u := -1.0 + 2.0*(cast(float) x / w);
 
             color: Vector3;
+            depth: float = FLOAT32_MAX;
 
             SAMPLE_COUNT :: 1;
 
             for 0..SAMPLE_COUNT-1
             {
-                camera_d := lerp(camera.d, camera.prev_d, random_unilateral(*random));
+                camera_d := normalize(lerp(camera.d, camera.prev_d, random_unilateral(*random)));
                 camera_x, camera_y, camera_z := basis_vectors(camera_d);
 
                 p := camera.p;
@@ -255,25 +269,31 @@ render_scene :: (camera: Camera, scene: *Scene, acc: Accumulation_Buffer, tile: 
                 jitter_y := 0.5*random_bilateral(*random);
 
                 film_p := film_o;
-                film_p += (u + pixel_w*jitter_x)*half_film_w*camera_x;
-                film_p += (v + pixel_h*jitter_y)*half_film_h*camera_y;
+                film_p += (u + pixel_w*jitter_x)*film_w*camera_x;
+                film_p += (v + pixel_h*jitter_y)*film_h*camera_y;
 
                 d := normalize(film_p);
 
                 r := make_ray(p, d);
 
-                color += integrate_scene(scene, r, *random, x, y);
+                sample, sample_depth := integrate_scene(scene, camera_z, r, *random, x, y);
+
+                color += sample;
+                depth  = sample_depth;
             }
             color *= 1.0 / cast(float) SAMPLE_COUNT;
 
-            << get_texel(acc, x, y) += make_vector4(color.x, color.y, color.z, 1);
+            texel := get_texel(acc, x, y);
+            (<< texel).xyz += make_vector3(color.x, color.y, color.z);
+            (<< texel).w    = transform_depth(depth, NEAR_PLANE);
         }
     }
 }
 
 MAX_BOUNCES :: 8;
+NEAR_PLANE  :: 1.0;
 
-integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: int, y: int) -> Vector3
+integrate_scene :: (using scene: Scene, camera_z: Vector3, in_ray: Ray, random: *Random_Series, x: int, y: int) -> Vector3, float
 {
     throughput := Vector3.{1, 1, 1};
     color      := Vector3.{0, 0, 0};
@@ -281,14 +301,21 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: 
     ray := in_ray;
     last_vertex_specular := false;
 
+    first_hit_t := FLOAT32_MAX;
+
+    bounce := 0;
     for 0..MAX_BOUNCES-1
     {
-        t, primitive := intersect_scene(scene, ray, random);
+        bounce = it;
+
+        t, primitive := inline intersect_scene(scene, ray, random);
 
         if primitive
         {
             hit_p  := ray.o + t*ray.d;
             n := inline get_normal(primitive, hit_p);
+
+            if bounce == 0  first_hit_t = -dot(hit_p - ray.o, camera_z);
 
             material := *materials[primitive.material_index];
 
@@ -303,27 +330,38 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: 
 
             brdf := material.color*(1.0 / PI);
 
-            throughput *= brdf;
-
-            cos_theta_i := -dot(ray.d, n);
-
             eta_i := 1.0; // air
             eta_t := material.ior;
+
+            cos_theta_i := -dot(ray.d, n);
+            inside_surface := cos_theta_i < 0.0;
+            if inside_surface
+            {
+                eta_i, eta_t = swap(eta_i, eta_t);
+
+                cos_theta_i = -cos_theta_i;
+                n = -n;
+            }
+
             eta_i_over_eta_t := eta_i / eta_t;
 
-            reflectance, cos_theta_t := fresnel_dielectric(cos_theta_i, eta_i, eta_t, eta_i_over_eta_t);
+            reflectance, cos_theta_t := inline fresnel_dielectric(cos_theta_i, eta_i, eta_t, eta_i_over_eta_t);
 
             e: Vector3;
 
-            if frame_index < g_blue_noise3.count
+            if frame_index < 2*g_blue_noise3.count
             {
-                e = sample_blue_noise3(frame_index, x, y);
+                e = inline sample_blue_noise3(total_frame_index, x, y);
+                GOLDEN_RATIO :: 1.61803;
+                e.x = frac((frame_index / g_blue_noise3.count)*GOLDEN_RATIO + e.x);
+                e.y = frac((frame_index / g_blue_noise3.count)*GOLDEN_RATIO + e.y);
+                e.z = frac((frame_index / g_blue_noise3.count)*GOLDEN_RATIO + e.z);
             }
             else
             {
-                e.x = random_unilateral(random);
-                e.y = random_unilateral(random);
-                e.z = random_unilateral(random);
+                e.x = inline random_unilateral(random);
+                e.y = inline random_unilateral(random);
+                e.z = inline random_unilateral(random);
             }
 
             if e.x < reflectance
@@ -331,6 +369,20 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: 
                 last_vertex_specular = true;
 
                 ray = make_ray(hit_p + EPSILON*n, reflect(ray.d, n));
+            }
+            else if material.kind == .Translucent
+            {
+                refracted := refract(ray.d, n, cos_theta_i, cos_theta_t, eta_i_over_eta_t);
+                ray = make_ray(hit_p + EPSILON*refracted, refracted);
+
+                if inside_surface
+                {
+                    throughput *= make_vector3(
+                        exp(-t*material.color.x),
+                        exp(-t*material.color.y),
+                        exp(-t*material.color.z),
+                    );
+                }
             }
             else
             {
@@ -354,6 +406,7 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: 
 
                 ray = make_ray(hit_p + EPSILON*n, r);
 
+                throughput *= brdf;
                 throughput *= dot(ray.d, n);
                 throughput *= 2*PI;
             }
@@ -361,14 +414,13 @@ integrate_scene :: (using scene: Scene, in_ray: Ray, random: *Random_Series, x: 
         else
         {
             sky_col := lerp(sky_bot, sky_top, saturate(ray.d.y));
-
             color += throughput*sky_col;
 
             break;
         }
     }
 
-    return color;
+    return color, first_hit_t;
 }
 
 random_point_on_light :: (using scene: Scene, hit_p: Vector3, random: *Random_Series) -> l_dir: Vector3, l_normal: Vector3, l_dist: Vector3, l_area: float
@@ -406,7 +458,7 @@ intersect_scene :: (using scene: Scene, r: Ray, random: *Random_Series, $shadow_
         jitter_p := p.p - random_unilateral(random)*p.dp*dt;
 
         hit_t := inline intersect_plane(r, jitter_p, p.n);
-        if hit_t < t
+        if hit_t > 0.0 && hit_t < t
         {
             primitive = p;
             t = hit_t;
@@ -420,7 +472,7 @@ intersect_scene :: (using scene: Scene, r: Ray, random: *Random_Series, $shadow_
         jitter_p := s.p - random_unilateral(random)*s.dp*dt;
 
         hit_t := inline intersect_sphere(r, jitter_p, s.r);
-        if hit_t < t
+        if hit_t > 0.0 && hit_t < t
         {
             primitive = s;
             t = hit_t;
@@ -434,7 +486,7 @@ intersect_scene :: (using scene: Scene, r: Ray, random: *Random_Series, $shadow_
         jitter_p := b.p - random_unilateral(random)*b.dp*dt;
 
         hit_t := inline intersect_box(r, jitter_p - b.r, jitter_p + b.r);
-        if hit_t < t
+        if hit_t > 0.0 && hit_t < t
         {
             primitive = b;
             t = hit_t;
@@ -466,38 +518,40 @@ intersect_scene :: (using scene: Scene, r: Ray, random: *Random_Series, $shadow_
     return t, primitive;
 }
 
-intersect_plane :: inline (r: Ray, p: Vector3, n: Vector3) -> float
+intersect_plane :: (r: Ray, p: Vector3, n: Vector3) -> float
 {
     t := dot(n, p - r.o) / dot(n, r.d);
     if t > EPSILON  return t;
     else            return FLOAT32_MAX;
 }
 
-intersect_sphere :: inline (r: Ray, p: Vector3, radius: float) -> float
+intersect_sphere :: (r: Ray, p: Vector3, radius: float) -> float
 {
     m := r.o - p;
     b := dot(m, r.d);
     c := dot(m, m) - radius*radius;
 
-    if c > 0.0 && b > 0.0 then return FLOAT32_MAX;
+    if c > 0.0 && b > 0.0  return FLOAT32_MAX;
 
     discr := b*b - c;
 
-    if discr < 0.0 then return FLOAT32_MAX;
+    if discr < 0.0  return FLOAT32_MAX;
 
-    t := -b - square_root(discr);
+    discr_root := square_root(discr);
+    tn := -b - discr_root;
+    tf := -b + discr_root;
 
-    if t < 0.0 then t = 0.0;
+    t := ifx tn >= 0.0  tn else tf;
 
     return t;
 }
 
-intersect_box :: inline (r: Ray, b_min: Vector3, b_max: Vector3) -> float
+intersect_box :: (r: Ray, b_min: Vector3, b_max: Vector3) -> float
 {
     tx1 := r.inv_d.x*(b_min.x - r.o.x);
     tx2 := r.inv_d.x*(b_max.x - r.o.x);
     
-    t_min := Max(0.0, Min(tx1, tx2));
+    t_min := Min(tx1, tx2);
     t_max := Max(tx1, tx2);
 
     ty1 := r.inv_d.y*(b_min.y - r.o.y);
@@ -512,11 +566,13 @@ intersect_box :: inline (r: Ray, b_min: Vector3, b_max: Vector3) -> float
     t_min = Max(t_min, Min(tz1, tz2));
     t_max = Min(t_max, Max(tz1, tz2));
 
-    if t_max >= t_min return t_min;
-    else              return FLOAT32_MAX;
+    t := ifx t_min >= 0.0  t_min else t_max;
+
+    if t_max >= t_min  return t;
+    else               return FLOAT32_MAX;
 }
 
-get_normal :: inline (primitive: *Primitive, hit_p: Vector3) -> Vector3
+get_normal :: (primitive: *Primitive, hit_p: Vector3) -> Vector3
 {
     normal: Vector3 = ---;
 
